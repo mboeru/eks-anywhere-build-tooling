@@ -13,8 +13,11 @@ BUILD_LIB=$(BASE_DIRECTORY)/build/lib
 OUTPUT_BIN_DIR?=$(OUTPUT_DIR)/bin/$(REPO)
 
 SHELL_TRACE?=false
-DEFAULT_SHELL:=$(if $(filter true,$(SHELL_TRACE)),$(BUILD_LIB)/make_shell.sh trace,bash)
-SHELL:=$(DEFAULT_SHELL)
+TRACE_SHELL=$(BUILD_LIB)/make_shell.sh trace
+LOGGING_SHELL=$(BUILD_LIB)/make_shell.sh log
+NOOP_SHELL=true
+DEFAULT_SHELL=$(if $(filter true,$(SHELL_TRACE)),$(TRACE_SHELL),bash)
+SHELL=$(DEFAULT_SHELL)
 .SHELLFLAGS:=-eu -o pipefail -c
 #################### AWS ###########################
 AWS_REGION?=us-west-2
@@ -96,9 +99,9 @@ SKIPPED_K8S_VERSIONS?=
 BINARIES_ARE_RELEASE_BRANCHED?=true
 IS_RELEASE_BRANCH_BUILD=$(filter true,$(HAS_RELEASE_BRANCHES))
 UNRELEASE_BRANCH_BINARY_TARGETS=binaries attribution checksums
-IS_UNRELEASE_BRANCH_TARGET=$(and $(filter false,$(BINARIES_ARE_RELEASE_BRANCHED)),$(filter $(UNRELEASE_BRANCH_BINARY_TARGETS) $(foreach target,$(UNRELEASE_BRANCH_BINARY_TARGETS),run-$(target)-in-docker),$(MAKECMDGOALS)))
+IS_UNRELEASE_BRANCH_TARGET=$(and $(filter false,$(BINARIES_ARE_RELEASE_BRANCHED)),$(filter $(UNRELEASE_BRANCH_BINARY_TARGETS) $(foreach target,$(UNRELEASE_BRANCH_BINARY_TARGETS),run-$(target)-in-docker run-in-docker/$(target)),$(MAKECMDGOALS)))
 TARGETS_ALLOWED_WITH_NO_RELEASE_BRANCH?=
-TARGETS_ALLOWED_WITH_NO_RELEASE_BRANCH+=build release clean clean-extra clean-go-cache help stop-docker-builder create-ecr-repos all-attributions all-checksums all-attributions-checksums update-patch-numbers check-for-release-branch-skip
+TARGETS_ALLOWED_WITH_NO_RELEASE_BRANCH+=build release clean clean-extra clean-go-cache help start-docker-builder stop-docker-builder create-ecr-repos all-attributions all-checksums all-attributions-checksums update-patch-numbers check-for-release-branch-skip run-buildkit-and-registry
 MAKECMDGOALS_WITHOUT_VAR_VALUE=$(foreach t,$(MAKECMDGOALS),$(if $(findstring var-value-,$(t)),,$(t)))
 ifneq ($(and $(IS_RELEASE_BRANCH_BUILD),$(or $(RELEASE_BRANCH),$(IS_UNRELEASE_BRANCH_TARGET))),)
 	RELEASE_BRANCH_SUFFIX=$(if $(filter true,$(BINARIES_ARE_RELEASE_BRANCHED)),/$(RELEASE_BRANCH),)
@@ -173,9 +176,11 @@ IMAGE_IMPORT_CACHE?=type=registry,ref=$(LATEST_IMAGE) type=registry,ref=$(subst 
 
 BUILD_OCI_TARS?=false
 
-LOCAL_IMAGE_TARGETS=$(foreach image,$(IMAGE_NAMES),$(image)/images/amd64)
+LOCAL_IMAGE_TARGETS=$(foreach image,$(IMAGE_NAMES),$(image)/images/$(BUILDER_PLATFORM_ARCH))
 IMAGE_TARGETS=$(foreach image,$(IMAGE_NAMES),$(if $(filter true,$(BUILD_OCI_TARS)),$(call IMAGE_TARGETS_FOR_NAME,$(image)),$(image)/images/push))
 
+# intentionally not setting a default verison, we do not want projects depending on a default
+GOLANG_VERSION?=
 # If running in the builder base on prow or codebuild, grab the current tag to be used when building with cgo
 CURRENT_BUILDER_BASE_TAG=$(or $(and $(wildcard /config/BUILDER_BASE_TAG_FILE),$(shell cat /config/BUILDER_BASE_TAG_FILE)),latest)
 CURRENT_BUILDER_BASE_IMAGE=$(if $(CODEBUILD_BUILD_IMAGE),$(CODEBUILD_BUILD_IMAGE),$(BASE_IMAGE_REPO)/builder-base:$(CURRENT_BUILDER_BASE_TAG))
@@ -184,6 +189,7 @@ GOLANG_GCC_BUILDER_IMAGE=$(BASE_IMAGE_REPO)/golang:$(shell cat $(BASE_DIRECTORY)
 # in CODEBUILD always use buildctl
 BUILDCTL_AVAILABLE=$(or $(filter true,$(CODEBUILD_CI)),$(shell command -v buildctl &> /dev/null && buildctl debug workers &> /dev/null && echo "true" || echo "false"))
 BUILDX_AVAILABLE=$(shell docker buildx inspect &> /dev/null && echo "true" || echo "false")
+DOCKER_AVAILABLE=$(shell command -v docker &> /dev/null && docker info &> /dev/null && echo "true" || echo "false")
 ####################################################
 
 #################### HELM ##########################
@@ -200,6 +206,7 @@ HELM_DESTINATION_REPOSITORY?=$(IMAGE_COMPONENT)
 HELM_IMAGE_LIST?=
 HELM_GIT_CHECKOUT_TARGET?=$(HELM_SOURCE_REPOSITORY)/eks-anywhere-checkout-$(HELM_GIT_TAG)
 HELM_GIT_PATCH_TARGET?=$(HELM_SOURCE_REPOSITORY)/eks-anywhere-helm-patched
+PACKAGE_DEPENDENCIES?=
 ####################################################
 
 #### HELPERS ########
@@ -431,12 +438,48 @@ UPLOAD_DO_NOT_DELETE?=false
 KUSTOMIZE_VERSION=4.5.7
 KUSTOMIZE_TARGET=$(OUTPUT_DIR)/kustomize
 GIT_DEPS_DIR?=$(OUTPUT_DIR)/gitdependencies
-SPECIAL_TARGET_SECONDARY=$(strip $(PROJECT_DEPENDENCIES_TARGETS) $(GO_MOD_DOWNLOAD_TARGETS))
+SPECIAL_TARGET_SECONDARY+=$(strip $(PROJECT_DEPENDENCIES_TARGETS) $(GO_MOD_DOWNLOAD_TARGETS))
 SKIP_CHECKSUM_VALIDATION?=false
-IN_DOCKER_TARGETS=all-attributions all-attributions-checksums all-checksums attribution attribution-checksums binaries checksums clean clean-go-cache
+IN_DOCKER_TARGETS=all-attributions all-attributions-checksums all-checksums attribution attribution-checksums binaries checksums clean clean-go-cache validate-checksums $(GO_MOD_DOWNLOAD_TARGETS) $(BINARY_TARGETS) $(GATHER_LICENSES_TARGETS)
 PRUNE_BUILDCTL?=false
 GITHUB_TOKEN?=
+
+# if this is set we are running in the context of a run-<>-in-docker target
+DOCKER_RUN_BASE_DIRECTORY?=
 DEPENDENCY_TOOLS=buildctl helm jq lz4 skopeo tuftool yq
+
+# set to true if do not care about checksum match, default to false to limit confusion
+# around checksum mismatch
+FORCE_BUILD_ON_HOST?=false
+
+# $1 - target(s)
+# $2 - should run on host
+MAYBE_RUN_IN_DOCKER?=$(if \
+	$(or \
+		$(filter true,$(IS_ON_BUILDER_BASE)), \
+		$(filter true,$(FORCE_BUILD_ON_HOST)), \
+		$(filter true,$2), \
+		$(filter false,$(EVAL_DOCKER_AVAILABLE)) \
+	),,$(foreach target,$1,run-in-docker/$(target)))
+
+# this can be used as a normal macro, $(ENABLE_DOCKER), or as a func with 1 param, $(call ENABLE_DOCKER)
+# $1 - should run on host (optional)
+ENABLE_DOCKER=$(ENABLE_LOGGING)$(eval $(call ENABLE_DOCKER_BODY,$@,$(if $(filter undefined,$(origin 1)),false,$(value 1))))$(DOCKER_TARGET)
+
+# $1 - target name
+# $2 - should run on host
+# SHELL is overriden to the cli `true` so that when the actual target ends up running on the host it is an noop
+# since we are manipulating the SHELL here we have to make sure any variables which are going to be used in the
+# context of MAYBE_RUN_IN_DOCKER cannot themselves call out to a shell, we force eval to avoid
+define ENABLE_DOCKER_BODY
+$(eval _TARGET:=$1)
+$(eval _RUN_ON_HOST:=$2)
+$(_TARGET): EVAL_DOCKER_AVAILABLE:=$$(DOCKER_AVAILABLE)
+$(_TARGET): EVAL_RUN_ON_HOST:=$$(_RUN_ON_HOST)
+$(_TARGET): DOCKER_TARGET=$$(call MAYBE_RUN_IN_DOCKER,$$@,$$(EVAL_RUN_ON_HOST))
+$(_TARGET): SHELL=$$(if $$(DOCKER_TARGET),$$(NOOP_SHELL),$$(LOGGING_SHELL))
+endef
+
 ####################################################
 
 #################### LOGGING #######################
@@ -453,7 +496,7 @@ ENABLE_LOGGING=$(eval $(call ENABLE_LOGGING_BODY,$@))
 define ENABLE_LOGGING_BODY
 $(eval _TARGET:=$1)
 $(_TARGET): export LOGGING_TARGET=$(_TARGET)
-$(_TARGET): SHELL=$(BUILD_LIB)/make_shell.sh log
+$(_TARGET): SHELL=$$(LOGGING_SHELL)
 endef
 ####################################################
 
@@ -465,7 +508,7 @@ RELEASE_TARGETS?=validate-checksums $(if $(IMAGE_NAMES),images,) $(if $(filter t
 # convert commonly used, usually shell call, variables to lazily resolved cached variables
 CACHE_VARS=AWS_ACCOUNT_ID BUILD_IDENTIFIER BUILDER_PLATFORM_ARCH BUILDER_PLATFORM_OS DATE_CMD DATE_NANO \
 	GIT_HASH GIT_TAG GO_BUILD_CACHE GO_MOD_CACHE GOLANG_VERSION HELM_GIT_TAG IS_ON_BUILDER_BASE \
-	PROJECT_DEPENDENCIES_TARGETS SUPPORTED_K8S_VERSIONS BUILDCTL_AVAILABLE BUILDX_AVAILABLE
+	PROJECT_DEPENDENCIES_TARGETS SUPPORTED_K8S_VERSIONS BUILDCTL_AVAILABLE BUILDX_AVAILABLE DOCKER_AVAILABLE
 $(foreach v,$(strip $(CACHE_VARS)),$(call CACHE_VARIABLE,$(v)))
 
 define BUILDCTL
@@ -489,7 +532,7 @@ endef
 # This will occansionally stall out in codebuild for an unknown reason
 # retry after a configurable timeout
 define CGO_DOCKER
-	$(BUILD_LIB)/run_target_docker.sh $(COMPONENT) $(CGO_TARGET) $(IMAGE_REPO) "$(RELEASE_BRANCH)" "$(ARTIFACTS_BUCKET)" "$(BASE_DIRECTORY)" "$(GO_MOD_CACHE)" true "$(IMAGE_PLATFORMS)"
+	$(BUILD_LIB)/run_target_docker.sh $(COMPONENT) $(CGO_TARGET) $(IMAGE_REPO) "$(RELEASE_BRANCH)" "$(ARTIFACTS_BUCKET)" "$(BASE_DIRECTORY)" "$(GO_MOD_CACHE)" "$(BUILDER_PLATFORM_ARCH)" true "$(IMAGE_PLATFORMS)"
 endef
 
 define SIMPLE_CREATE_BINARIES_SHELL
@@ -549,11 +592,9 @@ endif
 
 ## GO mod download targets
 $(REPO)/%ks-anywhere-go-mod-download: REPO_SUBPATH=$(if $(filter e,$*),,$(*:%/e=%))
-$(REPO)/%ks-anywhere-go-mod-download: $(if $(PATCHES_DIR),$(GIT_PATCH_TARGET),$(GIT_CHECKOUT_TARGET))
-	@echo -e $(call TARGET_START_LOG)
-	if [[ "$(GO_MODS_VENDORED)" == "false" ]]; then $(BASE_DIRECTORY)/build/lib/go_mod_download.sh $(MAKE_ROOT) $(REPO) $(GIT_TAG) $(GOLANG_VERSION) "$(REPO_SUBPATH)"; fi
-	@touch $@
-	@echo -e $(call TARGET_END_LOG)
+$(REPO)/%ks-anywhere-go-mod-download: $(if $(PATCHES_DIR),$(GIT_PATCH_TARGET),$(GIT_CHECKOUT_TARGET)) | $$(ENABLE_DOCKER)
+	@if [[ "$(GO_MODS_VENDORED)" == "false" ]]; then $(BASE_DIRECTORY)/build/lib/go_mod_download.sh $(MAKE_ROOT) $(REPO) $(GIT_TAG) $(GOLANG_VERSION) "$(REPO_SUBPATH)"; fi; \
+	touch $@
 
 ifneq ($(REPO),$(HELM_SOURCE_REPOSITORY))
 $(HELM_SOURCE_REPOSITORY):
@@ -588,7 +629,10 @@ $(OUTPUT_BIN_DIR)/%: BINARY_TARGET=$(@F:%.exe=%)
 $(OUTPUT_BIN_DIR)/%: SOURCE_PATTERN=$(if $(filter $(BINARY_TARGET),$(BINARY_TARGET_FILES_BUILD_TOGETHER)),$(SOURCE_PATTERNS_BUILD_TOGETHER),$(word $(call pos,$(BINARY_TARGET),$(BINARY_TARGET_FILES)),$(SOURCE_PATTERNS)))
 $(OUTPUT_BIN_DIR)/%: OUTPUT_PATH=$(if $(and $(if $(filter false,$(call IS_ONE_WORD,$(BINARY_TARGET_FILES_BUILD_TOGETHER))),$(filter $(BINARY_TARGET),$(BINARY_TARGET_FILES_BUILD_TOGETHER)))),$(@D)/,$@)
 $(OUTPUT_BIN_DIR)/%: GO_MOD_PATH=$($(call GO_MOD_TARGET_FOR_BINARY_VAR_NAME,$(BINARY_TARGET)))
-$(OUTPUT_BIN_DIR)/%: $$(call GO_MOD_DOWNLOAD_TARGET_FROM_GO_MOD_PATH,$$(GO_MOD_PATH)) | $$(ENABLE_LOGGING)
+$(OUTPUT_BIN_DIR)/%: GO_MOD_DOWNLOAD_TARGET=$(call GO_MOD_DOWNLOAD_TARGET_FROM_GO_MOD_PATH,$(GO_MOD_PATH))
+# since cgo is going to run on a docker container anyway, do not start in a docker container
+$(OUTPUT_BIN_DIR)/%: START_CGO_ON_HOST=$(if $(filter true,$(NEEDS_CGO_BUILDER)),true,false)
+$(OUTPUT_BIN_DIR)/%: $$(GO_MOD_DOWNLOAD_TARGET) | $$(call ENABLE_DOCKER,$$(START_CGO_ON_HOST))
 	$(if $(NEEDS_CGO_BUILDER),$(call CGO_CREATE_BINARIES_SHELL,$@,$(*D)),$(call SIMPLE_CREATE_BINARIES_SHELL))
 endif
 
@@ -633,7 +677,8 @@ $(OUTPUT_DIR)/%TTRIBUTION.txt:
 $(OUTPUT_DIR)/%ttribution/go-license.csv: BINARY_TARGET=$(if $(filter .,$(*D)),,$(*D))
 $(OUTPUT_DIR)/%ttribution/go-license.csv: GO_MOD_PATH=$(if $(BINARY_TARGET),$(GO_MOD_TARGET_FOR_BINARY_$(call TO_UPPER,$(BINARY_TARGET))),$(word 1,$(UNIQ_GO_MOD_PATHS)))
 $(OUTPUT_DIR)/%ttribution/go-license.csv: LICENSE_PACKAGE_FILTER=$(GO_MOD_$(subst /,_,$(GO_MOD_PATH))_LICENSE_PACKAGE_FILTER)
-$(OUTPUT_DIR)/%ttribution/go-license.csv: $$(call GO_MOD_DOWNLOAD_TARGET_FROM_GO_MOD_PATH,$$(GO_MOD_PATH)) | ensure-jq $$(ENABLE_LOGGING)
+$(OUTPUT_DIR)/%ttribution/go-license.csv: GO_MOD_DOWNLOAD_TARGET=$(call GO_MOD_DOWNLOAD_TARGET_FROM_GO_MOD_PATH,$(GO_MOD_PATH)) 
+$(OUTPUT_DIR)/%ttribution/go-license.csv: $$(GO_MOD_DOWNLOAD_TARGET) | ensure-jq $$(ENABLE_DOCKER)
 	@$(BASE_DIRECTORY)/build/lib/gather_licenses.sh $(REPO) $(MAKE_ROOT)/$(OUTPUT_DIR)/$(BINARY_TARGET) "$(LICENSE_PACKAGE_FILTER)" $(GO_MOD_PATH) $(GOLANG_VERSION) $(LICENSE_THRESHOLD) $(CGO_ENABLED)
 
 .PHONY: gather-licenses
@@ -643,7 +688,9 @@ gather-licenses: $(GATHER_LICENSES_TARGETS)
 # if there is only one go mod path so only one attribution is created, the file will be named ATTRIBUTION.txt and licenses will be stored in _output, `%` will equal `A`
 # if multiple attributions are being generated, the file will be <binary>_ATTRIBUTION.txt and licenses will be stored in _output/<binary>, `%` will equal `<BINARY>_A`
 %TTRIBUTION.txt: LICENSE_OUTPUT_PATH=$(OUTPUT_DIR)$(if $(filter A,$(*F)),,/$(call TO_LOWER,$(*F:%_A=%)))
-%TTRIBUTION.txt: $$(LICENSE_OUTPUT_PATH)/attribution/go-license.csv | $$(ENABLE_LOGGING)
+%TTRIBUTION.txt: GENERATE_ATTR_AVAIL=$(shell command -v generate-attribution &> /dev/null && echo "true" || echo "false")
+%TTRIBUTION.txt: LICENSE_TARGET=$(LICENSE_OUTPUT_PATH)/attribution/go-license.csv
+%TTRIBUTION.txt: $$(LICENSE_TARGET) | $$(call ENABLE_DOCKER,$$(GENERATE_ATTR_AVAIL))
 	@$(BASE_DIRECTORY)/build/lib/create_attribution.sh $(MAKE_ROOT) $(GOLANG_VERSION) $(MAKE_ROOT)/$(LICENSE_OUTPUT_PATH) $(@F) $(RELEASE_BRANCH)
 
 .PHONY: attribution
@@ -789,10 +836,9 @@ binary-builder/cgo/%: USE_DOCKER_FOR_CGO_BUILD=$(shell command -v docker &> /dev
 %-useradd/images/export: IMAGE_OUTPUT?=dest=$(IMAGE_OUTPUT_DIR)
 %-useradd/images/export: IMAGE_BUILD_ARGS=IMAGE_USERADD_USER_ID IMAGE_USERADD_USER_NAME
 %-useradd/images/export: DOCKERFILE_FOLDER=$(BUILD_LIB)/docker/linux/useradd
-%-useradd/images/export: IMAGE_PLATFORMS=linux/amd64
-%-useradd/images/export: | $$(ENSURE_PREREQ)
-	@mkdir -p $(IMAGE_OUTPUT_DIR)
-	$(BUILDCTL)
+%-useradd/images/export: IMAGE_PLATFORMS=linux/$(BUILDER_PLATFORM_ARCH)
+%-useradd/images/export: | $$(ENSURE_PREREQ) $$(ENABLE_LOGGING)
+	@mkdir -p $(IMAGE_OUTPUT_DIR) && $(BUILDCTL)
 
 ## Helm Targets
 .PHONY: helm/pull 
@@ -821,11 +867,10 @@ helm/push: helm/build | ensure-helm $$(ENABLE_LOGGING)
 handle-dependencies: $(call PROJECT_DEPENDENCIES_TARGETS)
 
 $(BINARY_DEPS_DIR)/linux-%: | $$(ENABLE_LOGGING)
-	$(BUILD_LIB)/fetch_binaries.sh $(BINARY_DEPS_DIR) $* $(ARTIFACTS_BUCKET) $(LATEST) $(RELEASE_BRANCH)
+	@$(BUILD_LIB)/fetch_binaries.sh $(BINARY_DEPS_DIR) $* $(ARTIFACTS_BUCKET) $(LATEST) $(RELEASE_BRANCH)
 
 ## Build Targets
 .PHONY: build
-
 build: $(BUILD_TARGETS)
 
 .PHONY: release
@@ -865,9 +910,14 @@ clean-go-cache:
 clean-repo:
 	@rm -rf $(REPO)	$(HELM_SOURCE_REPOSITORY)
 
+# intentionally not using OUTPUT_DIR variable to ensure we
+# delete the entire output folder for release branch'd projects
 .PHONY: clean-output
 clean-output:
-	$(if $(wildcard _output),du -hs _output && rm -rf _output,)
+	@if [ -d _output ]; then \
+		du -hs _output; \
+		rm -rf _output; \
+	fi
 
 .PHONY: clean
 clean: $(if $(filter true,$(REPO_NO_CLONE)),,clean-repo) clean-output
@@ -897,13 +947,21 @@ add-generated-help-block:
 ## --------------------------------------
 #@ Update Helpers
 
-.PHONY: run-target-in-docker
-run-target-in-docker: | ensure-docker # Run `MAKE_TARGET` using builder base docker container
-	$(BUILD_LIB)/run_target_docker.sh $(COMPONENT) $(MAKE_TARGET) $(IMAGE_REPO) "$(RELEASE_BRANCH)" "$(ARTIFACTS_BUCKET)" "$(BASE_DIRECTORY)" "$(GO_MOD_CACHE)"
+.PHONY: start-docker-builder
+start-docker-builder: # Start long lived builder base docker container
+	$(BUILD_LIB)/run_target_docker.sh $(COMPONENT) var-value-PULL_BASE_REF $(IMAGE_REPO) "$(RELEASE_BRANCH)" "$(ARTIFACTS_BUCKET)" "$(BASE_DIRECTORY)" "$(GO_MOD_CACHE)" "$(BUILDER_PLATFORM_ARCH)" false
 
 .PHONY: stop-docker-builder
 stop-docker-builder: # Clean up builder base docker container
-	docker rm -f -v eks-a-builder
+	$(MAKE) -C $(BASE_DIRECTORY) stop-docker-builder
+
+.PHONY: run-buildkit-and-registry
+run-buildkit-and-registry: # Run buildkitd and a local docker registry as containers
+	$(MAKE) -C $(BASE_DIRECTORY) run-buildkit-and-registry
+
+.PHONY: stop-buildkit-and-registry
+stop-buildkit-and-registry: # Stop the buildkitd and a local docker registry containers
+	$(MAKE) -C $(BASE_DIRECTORY) stop-buildkit-and-registry
 
 .PHONY: generate
 generate: | ensure-locale # Update UPSTREAM_PROJECTS.yaml
@@ -930,7 +988,7 @@ patch-for-dep-update: checkout-repo
 
 .PHONY: %/create-ecr-repo
 %/create-ecr-repo: IMAGE_NAME=$*
-%/create-ecr-repo:
+%/create-ecr-repo: | $$(ENABLE_LOGGING)
 	cmd=( ecr ); \
 	if [[ "${IMAGE_REPO}" =~ ^public\.ecr\.aws/ ]]; then \
 		cmd=( ecr-public --region us-east-1 ); \
@@ -1049,14 +1107,21 @@ ensure-bash-version:
 ## --------------------------------------
 ## Docker Helpers
 ## --------------------------------------
-# $1 - target
-define RUN_IN_DOCKER_TARGET
-.PHONY: run-$(1)-in-docker
-run-$(1)-in-docker: MAKE_TARGET=$(1)
-run-$(1)-in-docker: run-target-in-docker
-endef
+# since these targets will likely be file paths it has to be run-in-docker/ vs run-in-docker- otherwise make
+# will not properly match the stem. this requires a change to how we used to name these targets
+.PHONY: run-in-docker/%
+run-in-docker/%: MAKE_TARGET=$*
+# on AL2/AL23 the $$(ENABLE_LOGGING) approach does not appear to work, but it does on Mac
+# on Mac the explicit vars here do not work. doing both seems to work in both cases
+run-in-docker/%: export LOGGING_TARGET=$@
+run-in-docker/%: SHELL=$(LOGGING_SHELL)
+run-in-docker/%: | ensure-docker $$(ENABLE_LOGGING)
+	@$(BUILD_LIB)/run_target_docker.sh $(COMPONENT) $(MAKE_TARGET) $(IMAGE_REPO) "$(RELEASE_BRANCH)" "$(ARTIFACTS_BUCKET)" "$(BASE_DIRECTORY)" "$(GO_MOD_CACHE)" "$(BUILDER_PLATFORM_ARCH)" true
 
-$(foreach target,$(IN_DOCKER_TARGETS),$(eval $(call RUN_IN_DOCKER_TARGET,$(target))))
+# backcompat old style run-<>-in-docker style targets which work for anything that does not have a / in the target
+.PHONY: run-%-in-docker
+run-%-in-docker: run-in-docker/%
+	@echo "Please switch to 'run-in-docker/$*' style targets"
 
 # make sure by default all targets use the 
 # if we do not have this as a catch all target then the first target

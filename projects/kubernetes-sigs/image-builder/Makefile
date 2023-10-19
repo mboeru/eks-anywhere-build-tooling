@@ -5,6 +5,9 @@ GIT_TAG=$(shell cat GIT_TAG)
 REPO=image-builder
 REPO_OWNER=kubernetes-sigs
 
+# no container images for this project
+IMAGE_NAMES=
+
 IMAGE_BUILDER_DIR=$(REPO)/images/capi
 RAW_IMAGE_BUILD_AMI?=ami-095413544ce52437d
 RAW_IMAGE_BUILD_INSTANCE_TYPE?=t2.micro
