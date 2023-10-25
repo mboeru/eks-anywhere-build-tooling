@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -x
 set -o errexit
 set -o nounset
 set -o pipefail
+
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "${SCRIPT_ROOT}/common.sh"
 
 REGISTRY="${1?First argument is registry}"
 REPOSITORY="${2?Second argument is repository}"
@@ -30,5 +32,5 @@ fi
 TMPFILE=$(mktemp)
 trap "rm -f $TMPFILE" exit
 TARGET=${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}
-skopeo inspect -n --raw docker://${TARGET} >${TMPFILE}
-skopeo manifest-digest ${TMPFILE}
+build::common::echo_and_run skopeo inspect -n --raw docker://${TARGET} >${TMPFILE}
+build::common::echo_and_run skopeo manifest-digest ${TMPFILE}

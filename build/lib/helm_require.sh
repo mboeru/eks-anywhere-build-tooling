@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -x
 set -e
 set -o errexit
 set -o nounset
@@ -27,13 +26,14 @@ HELM_TAG="${5?Fifth argument is helm tag}"
 PROJECT_ROOT="${6?Sixth argument is project root}"
 LATEST="${7?Seventh argument is latest tag}"
 HELM_USE_UPSTREAM_IMAGE="${8?Eigth argument is bool determining whether to use cached upstream images}"
-HELM_IMAGE_LIST="${@:9}"
+PACKAGE_DEPENDENCIES="${9?Ninth argument is optional project dependencies}"
+FORCE_JSON_SCHEMA_FILE="${10?Tenth argument is optional schema file}"
+HELM_IMAGE_LIST="${@:11}"
 
 CHART_NAME=$(basename ${HELM_DESTINATION_REPOSITORY})
 DEST_DIR=${OUTPUT_DIR}/helm/${CHART_NAME}
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-PACKAGE_DEPENDENCIES=${PACKAGE_DEPENDENCIES:=""}
-FORCE_JSON_SCHEMA_FILE=${FORCE_JSON_SCHEMA_FILE:=""}
+source "${SCRIPT_ROOT}/common.sh"
 
 #
 # Image tags
@@ -64,14 +64,27 @@ do
   else
     TAG="${LATEST}"
   fi
-  IMAGE_SHASUM=$(${SCRIPT_ROOT}/image_shasum.sh ${HELM_REGISTRY} ${IMAGE} ${TAG}) ||
-  IMAGE_SHASUM=$(${SCRIPT_ROOT}/image_shasum.sh ${IMAGE_REGISTRY} ${IMAGE} ${TAG})
+  
+  if aws --region us-east-1 ecr-public describe-repositories --repository-names ${IMAGE} &> /dev/null; then
+    IMAGE_SHASUM=$(${SCRIPT_ROOT}/image_shasum.sh ${HELM_REGISTRY} ${IMAGE} ${TAG})
+  elif aws ecr describe-repositories --repository-names ${IMAGE} &> /dev/null; then
+    IMAGE_SHASUM=$(${SCRIPT_ROOT}/image_shasum.sh ${IMAGE_REGISTRY} ${IMAGE} ${TAG})
+  elif [ "${HELM_USE_UPSTREAM_IMAGE}" == true ]; then
+    IMAGE_SHASUM=$(${SCRIPT_ROOT}/image_shasum.sh ${IMAGE_REGISTRY} ${IMAGE} ${TAG})
+  else
+    echo "${IMAGE} repository does not exist in ECR Public or Private"
+    exit 1
+  fi
   echo "s,{{${IMAGE}}},${IMAGE_SHASUM},g" >>${SEDFILE}
   if [ "${TAG}" == "latest" ]
   then
-    USE_TAG=$(aws --region us-east-1 ecr-public describe-images --repository-name ${IMAGE} --image-ids imageTag=latest --query 'imageDetails[0].imageTags' --output yaml | grep -v latest | head -1| sed -e 's/- //') ||
-    USE_TAG=$(aws ecr describe-images --repository-name ${IMAGE} --image-id imageTag=latest --query 'imageDetails[0].imageTags' --output yaml | grep -v latest | head -1| sed -e 's/- //') ||
-    USE_TAG="latest"
+    if aws --region us-east-1 ecr-public describe-repositories --repository-names ${IMAGE} &> /dev/null; then
+      USE_TAG=$(aws --region us-east-1 ecr-public describe-images --repository-name ${IMAGE} --image-ids imageTag=latest --query 'imageDetails[0].imageTags' --output yaml | grep -v latest | head -1| sed -e 's/- //')
+    elif aws ecr describe-repositories --repository-names ${IMAGE} &> /dev/null; then
+      USE_TAG=$(aws ecr describe-images --repository-name ${IMAGE} --image-id imageTag=latest --query 'imageDetails[0].imageTags' --output yaml | grep -v latest | head -1| sed -e 's/- //')
+    else
+      USE_TAG="latest"
+    fi
   else
     USE_TAG=$TAG
   fi
@@ -100,7 +113,8 @@ fi
 
 if [ -f ${JSON_SCHEMA_FILE} ]
 then
-  JSON_SCHEMA=$(cat ${JSON_SCHEMA_FILE} | gzip | base64 | tr -d '\n')
+  echo "Using schema file: ${JSON_SCHEMA_FILE}"
+  JSON_SCHEMA=$(cat ${JSON_SCHEMA_FILE} | gzip -n | base64 | tr -d '\n')
   cat >>${REQUIRES_FILE} <<!
   schema: ${JSON_SCHEMA}
 !
@@ -112,3 +126,6 @@ if [ -n "${PACKAGE_DEPENDENCIES}" ]; then
       echo "  - ${dep}"
   done >> ${REQUIRES_FILE}
 fi
+
+build::common::echo_and_run cat ${SEDFILE}
+build::common::echo_and_run cat ${REQUIRES_FILE}

@@ -196,10 +196,22 @@ HELM_TAG?=$(GIT_TAG)-$(GIT_HASH)
 HELM_USE_UPSTREAM_IMAGE?=false
 # HELM_DIRECTORY must be a relative path from project root to the directory that contains a chart
 HELM_DIRECTORY?=.
-HELM_DESTINATION_REPOSITORY?=$(IMAGE_COMPONENT)
-HELM_IMAGE_LIST?=
+HELM_DESTINATION_REPOSITORY?=$(HELM_CHART_NAME)
+HELM_IMAGE_LIST?=$(IMAGE_COMPONENT)
 HELM_GIT_CHECKOUT_TARGET?=$(HELM_SOURCE_REPOSITORY)/eks-anywhere-checkout-$(HELM_GIT_TAG)
 HELM_GIT_PATCH_TARGET?=$(HELM_SOURCE_REPOSITORY)/eks-anywhere-helm-patched
+PACKAGE_DEPENDENCIES?=
+FORCE_JSON_SCHEMA_FILE?=
+HELM_CHART_NAMES?=$(IMAGE_COMPONENT)
+
+# *theory* for the enable_logging preqreq when targets are prereqs of other targets
+# for some reason the logging_shell does not get set for the targets which are acting as prereqs
+# so if you call helm/build it will only show the logging around helm/build, not all
+# by also defining all the actual targets (removing the wildcard) it seems to help make
+# figure something out so that the logging shell is properly set
+# this is only an issue in the newer version of Make running in AL2/23 vs on mac
+# $1 - helm action (copy|require|replace|build|push)
+FULL_CHART_TARGETS=$(addprefix $(HELM_CHART_NAMES),/helm/$1)
 ####################################################
 
 #### HELPERS ########
@@ -799,22 +811,31 @@ binary-builder/cgo/%: USE_DOCKER_FOR_CGO_BUILD=$(shell command -v docker &> /dev
 helm/pull: | $$(ENABLE_LOGGING)
 	@$(BUILD_LIB)/helm_pull.sh $(HELM_PULL_LOCATION) $(HELM_REPO_URL) $(HELM_PULL_NAME) $(REPO) $(HELM_DIRECTORY) $(CHART_VERSION) $(COPY_CRDS)
 
+.PHONY: %/helm/copy %/helm/require %/helm/replace %/helm/build %/helm/push
+%/helm/copy %/helm/require %/helm/replace %/helm/build %/helm/push: HELM_CHART_NAME=$*
+
+$(call FULL_CHART_TARGETS,copy) : %/helm/copy: $(LICENSES_TARGETS_FOR_PREREQ) $(if $(filter true,$(REPO_NO_CLONE)),,$(HELM_GIT_CHECKOUT_TARGET)) $(if $(wildcard $(PROJECT_ROOT)/helm/patches),$(HELM_GIT_PATCH_TARGET),) | ensure-helm ensure-skopeo $$(ENABLE_LOGGING)
+	@$(BUILD_LIB)/helm_copy.sh $(HELM_SOURCE_REPOSITORY) $(HELM_DESTINATION_REPOSITORY) $(HELM_DIRECTORY) $(OUTPUT_DIR)
+
+$(call FULL_CHART_TARGETS,require) : %/helm/require: %/helm/copy | $$(ENABLE_LOGGING)
+	@$(BUILD_LIB)/helm_require.sh $(HELM_SOURCE_IMAGE_REPO) $(HELM_DESTINATION_REPOSITORY) $(OUTPUT_DIR) $(IMAGE_TAG) $(HELM_TAG) $(PROJECT_ROOT) $(LATEST) $(HELM_USE_UPSTREAM_IMAGE) "$(PACKAGE_DEPENDENCIES)" "$(FORCE_JSON_SCHEMA_FILE)" $(HELM_IMAGE_LIST)
+
+$(call FULL_CHART_TARGETS,replace) : %/helm/replace: %/helm/require | $$(ENABLE_LOGGING)
+	@$(BUILD_LIB)/helm_replace.sh $(HELM_DESTINATION_REPOSITORY) $(OUTPUT_DIR)
+
+$(call FULL_CHART_TARGETS,build) : %/helm/build: %/helm/replace | $$(ENABLE_LOGGING)
+	@$(BUILD_LIB)/helm_build.sh $(OUTPUT_DIR) $(HELM_DESTINATION_REPOSITORY)
+
+$(call FULL_CHART_TARGETS,push) : %/helm/push: %/helm/build | $$(ENABLE_LOGGING)
+	@$(BUILD_LIB)/helm_push.sh $(IMAGE_REPO) $(HELM_DESTINATION_REPOSITORY) $(HELM_TAG) $(GIT_TAG) $(OUTPUT_DIR) $(LATEST)
+
 # Build helm chart
 .PHONY: helm/build
-helm/build: $(LICENSES_TARGETS_FOR_PREREQ)
-helm/build: $(if $(filter true,$(REPO_NO_CLONE)),,$(HELM_GIT_CHECKOUT_TARGET))
-helm/build: $(if $(wildcard $(PROJECT_ROOT)/helm/patches),$(HELM_GIT_PATCH_TARGET),) | ensure-helm ensure-skopeo
-	@echo -e $(call TARGET_START_LOG)
-	$(BUILD_LIB)/helm_copy.sh $(HELM_SOURCE_REPOSITORY) $(HELM_DESTINATION_REPOSITORY) $(HELM_DIRECTORY) $(OUTPUT_DIR)
-	$(BUILD_LIB)/helm_require.sh $(HELM_SOURCE_IMAGE_REPO) $(HELM_DESTINATION_REPOSITORY) $(OUTPUT_DIR) $(IMAGE_TAG) $(HELM_TAG) $(PROJECT_ROOT) $(LATEST) $(HELM_USE_UPSTREAM_IMAGE) $(HELM_IMAGE_LIST)
-	$(BUILD_LIB)/helm_replace.sh $(HELM_DESTINATION_REPOSITORY) $(OUTPUT_DIR)
-	$(BUILD_LIB)/helm_build.sh $(OUTPUT_DIR) $(HELM_DESTINATION_REPOSITORY)
-	@echo -e $(call TARGET_END_LOG)
+helm/build: $(foreach chart,$(HELM_CHART_NAMES),$(chart)/helm/build)
 
 # Build helm chart and push to registry defined in IMAGE_REPO.
 .PHONY: helm/push
-helm/push: helm/build | ensure-helm $$(ENABLE_LOGGING)
-	@$(BUILD_LIB)/helm_push.sh $(IMAGE_REPO) $(HELM_DESTINATION_REPOSITORY) $(HELM_TAG) $(GIT_TAG) $(OUTPUT_DIR) $(LATEST)
+helm/push: $(foreach chart,$(HELM_CHART_NAMES),$(chart)/helm/push)
 
 ## Fetch Binary Targets
 .PHONY: handle-dependencies 
@@ -936,8 +957,8 @@ patch-for-dep-update: checkout-repo
 		cmd=( ecr-public --region us-east-1 ); \
 	fi; \
 	repo=$(IMAGE_REPO_COMPONENT); \
-	if [ "$(IMAGE_NAME)" = "__helm__" ]; then \
-		repo="$(HELM_DESTINATION_REPOSITORY)"; \
+	if [[ "$(IMAGE_NAME)" = *"__helm__"* ]]; then \
+		repo="$(IMAGE_NAME:%/__helm__=%)"; \
 	fi; \
 	if ! aws $${cmd[*]} describe-repositories --repository-name "$$repo" > /dev/null 2>&1; then \
 		aws $${cmd[*]} create-repository --repository-name "$$repo"; \
@@ -945,7 +966,7 @@ patch-for-dep-update: checkout-repo
 
 .PHONY: create-ecr-repos
 create-ecr-repos: # Create repos in ECR for project images for local testing
-create-ecr-repos: $(foreach image,$(IMAGE_NAMES),$(image)/create-ecr-repo) $(if $(filter true,$(HAS_HELM_CHART)),__helm__/create-ecr-repo,)
+create-ecr-repos: $(foreach image,$(IMAGE_NAMES),$(image)/create-ecr-repo) $(if $(filter true,$(HAS_HELM_CHART)),$(foreach chart,$(HELM_CHART_NAMES),$(chart)/__helm__/create-ecr-repo),)
 
 .PHONY: var-value-%
 var-value-%:

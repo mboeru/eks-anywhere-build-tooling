@@ -24,12 +24,15 @@ COMPILER_IMAGE_VERSION=3.9
 
 HAS_HELM_CHART=true
 HELM_DIRECTORY=charts/emissary-ingress
-HELM_DESTINATION_REPOSITORY=emissary-ingress/emissary
-HELM_IMAGE_LIST=emissary-ingress/emissary
+HELM_CHART_NAMES=emissary-ingress/crds emissary-ingress/emissary
 
 AMBASSADOR_VERSION_TARGET=$(REPO)/python/ambassador.version
 
 include $(BASE_DIRECTORY)/Common.mk
+
+
+emissary-ingress/emissary/helm/%: PACKAGE_DEPENDENCIES=emissary/crds
+emissary/crds/helm/%: HELM_DIRECTORY=charts/crds
 
 $(GO_MOD_DOWNLOAD_TARGETS): $(AMBASSADOR_VERSION_TARGET)
 

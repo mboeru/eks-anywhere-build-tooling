@@ -13,7 +13,7 @@ IMAGE_REPO?=$(if $(AWS_ACCOUNT_ID),$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazo
 ECR_PUBLIC_URI?=$(shell aws ecr-public describe-registries --region us-east-1 --query 'registries[0].registryUri' --output text)
 JOB_TYPE?=
 
-RELEASE_BRANCH?=
+RELEASE_BRANCH?=$(LATEST_EKSD_RELEASE)
 GIT_HASH=$(shell git -C $(BASE_DIRECTORY) rev-parse HEAD)
 ALL_PROJECTS=$(shell $(BUILD_LIB)/all_projects.sh $(BASE_DIRECTORY))
 
@@ -32,7 +32,7 @@ $(foreach v,$(CACHE_VARS),$(call CACHE_VARIABLE,$(v)))
 .PHONY: clean-project-%
 clean-project-%:
 	$(eval PROJECT_PATH=$(call PROJECT_PATH_MAP,$*))
-	$(MAKE) clean -C $(PROJECT_PATH)
+	$(MAKE) clean -C $(PROJECT_PATH) RELEASE_BRANCH=$(RELEASE_BRANCH)
 
 .PHONY: clean
 clean: $(addprefix clean-project-, $(ALL_PROJECTS))
