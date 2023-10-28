@@ -47,6 +47,8 @@ clean: $(addprefix clean-project-, $(ALL_PROJECTS))
 ############################## BUILD ALL ###################################
 
 .PHONY: build-all
+build-all: UPLOAD_ARTIFACTS_TO_S3?=false
+build-all: BUILD_IDENTIFIER?=
 build-all: build-all-warning
 # Build projects with dependecies first to try and validate if there are any missing
 	@set -eu -o pipefail; \
@@ -89,7 +91,6 @@ projects/goharbor/harbor/eks-anywhere-full-build-complete:
 # Actual target
 %/eks-anywhere-full-build-complete: IMAGE_PLATFORMS=linux/$(BUILDER_PLATFORM_ARCH)
 # override this on the command line to true if you want to push to your own s3 bucket
-%/eks-anywhere-full-build-complete: UPLOAD_ARTIFACTS_TO_S3?=false
 %/eks-anywhere-full-build-complete: MAIN_TARGET=release
 %/eks-anywhere-full-build-complete:
 	@set -eu -o pipefail; \
@@ -127,6 +128,10 @@ projects/goharbor/harbor/eks-anywhere-full-build-complete:
 
 .PHONY: build-all-warning
 build-all-warning:
+	@if [ "$(UPLOAD_ARTIFACTS_TO_S3)" = "true" ] && [ -z "$(BUILD_IDENTIFIER)" ]; then \
+		echo "Set BUILD_IDENTIFIER=<something> to keep and consistent upload folder name"; \
+		exit 1; \
+	fi
 	@echo "*** Warning: this target is not meant to used except for specific testing situations ***"
 	@echo "*** this will likely fail and either way run for a really long time ***"
 
