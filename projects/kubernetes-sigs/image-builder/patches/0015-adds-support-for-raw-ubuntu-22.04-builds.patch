@@ -58,7 +58,7 @@ new file mode 100644
 index 000000000..8b699a18a
 --- /dev/null
 +++ b/images/capi/packer/raw/linux/ubuntu/http/22.04.efi/user-data
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,114 @@
 +#cloud-config
 +# Copyright 2022 The Kubernetes Authors.
 +#
@@ -181,7 +181,7 @@ new file mode 100644
 index 000000000..e2838e3c4
 --- /dev/null
 +++ b/images/capi/packer/raw/linux/ubuntu/http/22.04/user-data
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,93 @@
 +#cloud-config
 +# Copyright 2022 The Kubernetes Authors.
 +#
