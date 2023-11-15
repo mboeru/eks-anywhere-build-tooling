@@ -172,6 +172,7 @@ index 000000000..8b699a18a
 +    - curtin in-target --target=/target -- apt-get purge --auto-remove -y
 +    - curtin in-target --target=/target -- apt-get clean
 +    - curtin in-target --target=/target -- rm -rf /var/lib/apt/lists/*
++    - curtin in-target --target=/target -- touch /root/test
 diff --git a/images/capi/packer/raw/linux/ubuntu/http/22.04/meta-data b/images/capi/packer/raw/linux/ubuntu/http/22.04/meta-data
 new file mode 100644
 index 000000000..e69de29bb
@@ -273,6 +274,7 @@ index 000000000..e2838e3c4
 +    - curtin in-target --target=/target -- apt-get purge --auto-remove -y
 +    - curtin in-target --target=/target -- apt-get clean
 +    - curtin in-target --target=/target -- rm -rf /var/lib/apt/lists/*
++    - curtin in-target --target=/target -- touch /root/test
 diff --git a/images/capi/packer/raw/raw-ubuntu-2204-efi.json b/images/capi/packer/raw/raw-ubuntu-2204-efi.json
 new file mode 100644
 index 000000000..3de116312
